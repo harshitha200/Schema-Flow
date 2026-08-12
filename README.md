@@ -303,12 +303,6 @@ Or:
 curl http://localhost:8081/subjects
 ```
 
-Before the first event is published, the response may be:
-
-```json
-[]
-```
-
 ---
 
 ## 4. Build the project
