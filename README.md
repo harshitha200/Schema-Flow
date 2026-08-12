@@ -777,12 +777,6 @@ Future improvements could include:
 
 ---
 
-## License
-
-This project is available under the **MIT License**.
-
----
-
 ## Summary
 
 **SchemaFlow** provides a simple end-to-end example of how a Spring Boot application can safely exchange strongly typed events using Kafka, Avro, and Schema Registry.
@@ -801,6 +795,4 @@ Spring Boot Consumer
 PostgreSQL
 ```
 
-The main idea is simple:
 
-> **Treat the event schema as a contract so services can evolve without breaking each other.**
