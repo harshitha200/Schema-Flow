@@ -1,0 +1,542 @@
+================================================================================
+  KAFKA SCHEMA REGISTRY - SPRING BOOT REFERENCE IMPLEMENTATION
+================================================================================
+
+  An event-driven microservice demonstrating Avro serialization, Confluent
+  Schema Registry, and safe schema evolution across an independently deployed
+  Kafka producer and consumer.
+
+  Java 21  |  Spring Boot 3.5.6  |  Confluent 8.0.0  |  Avro 1.11.4  |  PostgreSQL
+  License: MIT
+
+--------------------------------------------------------------------------------
+  CONTENTS
+--------------------------------------------------------------------------------
+
+  1.  The problem this solves
+  2.  Architecture
+  3.  Tech stack
+  4.  Project layout
+  5.  Quickstart
+  6.  How it works
+  7.  Configuration reference
+  8.  Schema evolution walkthrough
+  9.  Running against Confluent Cloud
+  10. Testing
+  11. Troubleshooting
+  12. Design decisions
+  13. Roadmap
+  14. Contributing
+  15. License
+
+
+--------------------------------------------------------------------------------
+  1. THE PROBLEM THIS SOLVES
+--------------------------------------------------------------------------------
+
+  In an event-driven system, the producer and consumer are deployed
+  independently. The moment a producer adds a field, renames one, or changes a
+  type, every downstream consumer is at risk - and with plain JSON, you find out
+  in production.
+
+  This project shows the alternative: the schema IS the contract, enforced at
+  serialization time and version-checked by a registry before a bad schema ever
+  reaches a broker.
+
+  Concretely, it demonstrates how to:
+
+    - Enforce a typed data contract between services using Avro and Confluent
+      Schema Registry
+    - Evolve that contract without redeploying every consumer in lockstep
+    - Keep schema registration out of the application and inside CI/CD, where
+      it belongs
+    - Persist consumed events transactionally to PostgreSQL via Spring Data JPA
+    - Run the entire stack (Kafka, Schema Registry, Postgres) locally in one
+      command
+
+
+--------------------------------------------------------------------------------
+  2. ARCHITECTURE
+--------------------------------------------------------------------------------
+
+     HTTP POST /users
+           |
+           v
+  +---------------------+        +----------------------+
+  |   producer-app      |------->|   Schema Registry    |
+  |   :8080             |   1    |   :8081              |
+  |                     |<-------|  (compatibility gate)|
+  |  REST -> validate   |        +----------------------+
+  |  -> map to Avro     |
+  +----------+----------+
+             | 2  Avro-serialized record
+             v
+     +-------------------+
+     |   Kafka broker    |   topic: users.v1
+     |   :29092          |
+     +---------+---------+
+               | 3  schema id resolved from registry
+               v
+  +---------------------+
+  |   consumer-app      |
+  |   :8089             |
+  |                     |
+  |  deserialize Avro   |
+  |  -> map to JPA      |
+  +----------+----------+
+             | 4
+             v
+     +-------------------+
+     |   PostgreSQL      |   users.contact
+     |   :5432           |
+     +-------------------+
+
+  THE FLOW, STEP BY STEP
+
+  1. producer-app accepts a UserCreateRequest, applies Bean Validation, and
+     maps it to a generated Avro User record via MapStruct.
+
+  2. The Avro serializer resolves the schema against the registry and writes a
+     SCHEMA ID into the message header - the payload itself carries no schema,
+     keeping records compact.
+
+  3. consumer-app reads the schema ID off the record, fetches the writer schema
+     from the registry, and deserializes against its own reader schema. Avro
+     reconciles the two.
+
+  4. The record is mapped to a UserEntity and persisted to users.contact.
+
+  The producer and consumer share NO code except the common-schemas module -
+  which contains only the .avsc definition, not business logic. That is the
+  point: the contract is data, not a shared jar of DTOs.
+
+
+--------------------------------------------------------------------------------
+  3. TECH STACK
+--------------------------------------------------------------------------------
+
+  Layer            Technology                          Version
+  ---------------  ----------------------------------  ---------
+  Runtime          Java                                21
+  Framework        Spring Boot                         3.5.6
+  Messaging        Apache Kafka + Spring Kafka         -
+  Contracts        Apache Avro                         1.11.4
+  Registry         Confluent Schema Registry           8.0.0
+  Persistence      PostgreSQL + Spring Data JPA        -
+  Mapping          MapStruct                           1.6.3
+  Boilerplate      Lombok                              1.18.38
+  Testing          JUnit 5, Mockito                    5.14.2
+  Local infra      Docker Compose                      -
+
+
+--------------------------------------------------------------------------------
+  4. PROJECT LAYOUT
+--------------------------------------------------------------------------------
+
+  kafka-schema-registry-spring-demo/
+  |
+  +-- common-schemas/        Avro .avsc definitions -> generated Java classes
+  |   +-- src/main/avro/
+  |       +-- User.avsc      the data contract
+  |
+  +-- producer-app/          REST endpoint -> Avro -> Kafka         (:8080)
+  +-- consumer-app/          Kafka -> Avro -> JPA -> PostgreSQL     (:8089)
+  +-- postman/               ready-to-import request collection
+  +-- docker-compose.yml     Kafka, Zookeeper, Schema Registry, Postgres
+  +-- pom.xml                Maven aggregator
+
+  common-schemas is built first and installed to the local Maven repo. Both apps
+  depend on the generated classes - so a schema change is a COMPILE-TIME break,
+  not a runtime surprise.
+
+
+--------------------------------------------------------------------------------
+  5. QUICKSTART
+--------------------------------------------------------------------------------
+
+  PREREQUISITES
+    JDK 21+, Maven 3.9+ (or the bundled mvnw), Docker Desktop with ~4 GB
+    allocated.
+
+
+  STEP 1 - START THE INFRASTRUCTURE
+
+    docker compose up -d
+
+  Wait for Schema Registry to report healthy - it depends on Kafka and takes
+  about 30 seconds:
+
+    curl -s http://localhost:8081/subjects
+
+  An empty array [] means it is up and no schemas are registered yet.
+
+    Service            Endpoint                   Credentials
+    -----------------  -------------------------  ---------------------
+    Kafka broker       localhost:29092            -
+    Schema Registry    http://localhost:8081      -
+    PostgreSQL         localhost:5432             kafka / kafkaConfluent
+
+
+  STEP 2 - BUILD (GENERATE THE AVRO CLASSES FIRST)
+
+    ./mvnw clean install -DskipTests
+
+  *** THIS STEP IS NOT OPTIONAL ***
+  common-schemas runs the Avro Maven plugin to generate User.java from
+  User.avsc. Skip it and both apps fail to compile with:
+      cannot find symbol: class User
+
+
+  STEP 3 - CREATE THE DATABASE SCHEMA
+
+    docker compose exec -T postgres psql -U kafka -d kafka < ddl/schema.sql
+
+  DDL reference:
+
+    CREATE SCHEMA IF NOT EXISTS users;
+
+    CREATE TABLE IF NOT EXISTS users.contact (
+        id          int8 GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        userid      text,
+        email       text,
+        phone       text,
+        first_name  text,
+        last_name   text,
+        is_active   bool NOT NULL DEFAULT true,
+        created_at  timestamptz,
+        age         int4
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_users_created_at
+        ON users.contact (created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_users_email
+        ON users.contact (email);
+    CREATE INDEX IF NOT EXISTS idx_users_is_active
+        ON users.contact (is_active);
+
+  The three indexes cover the common access patterns: recent-first listing,
+  lookup by email, and filtering active users.
+
+
+  STEP 4 - RUN BOTH SERVICES
+
+  Two terminals.
+
+    # terminal 1 - consumer (start first so no messages are missed)
+    cd consumer-app && ../mvnw spring-boot:run
+
+    # terminal 2 - producer
+    cd producer-app && ../mvnw spring-boot:run
+
+
+  STEP 5 - SEND AN EVENT
+
+    curl -X POST http://localhost:8080/users \
+      -H "Content-Type: application/json" \
+      -d '{
+        "id": "u-1001",
+        "email": "ada@example.com",
+        "phone": "5551234567",
+        "firstName": "Ada",
+        "lastName": "Lovelace",
+        "isActive": true,
+        "age": 36
+      }'
+
+
+  STEP 6 - VERIFY END TO END
+
+    # the schema auto-registered on first publish
+    curl -s http://localhost:8081/subjects
+    -> ["users.v1-value"]
+
+    # the row landed
+    docker compose exec -T postgres psql -U kafka -d kafka \
+      -c "SELECT userid, email, first_name, age FROM users.contact;"
+
+     userid  |      email       | first_name | age
+    ---------+------------------+------------+-----
+     u-1001  | ada@example.com  | Ada        |  36
+
+
+--------------------------------------------------------------------------------
+  6. HOW IT WORKS
+--------------------------------------------------------------------------------
+
+  THE PRODUCER SIDE
+
+  The REST layer never touches Avro. A UserCreateRequest DTO carries Bean
+  Validation annotations; MapStruct generates the mapper to the Avro User
+  record at compile time (-Amapstruct.defaultComponentModel=spring, so mappers
+  are injectable Spring beans).
+
+  KafkaAvroSerializer then does the interesting part:
+
+    1. Extracts the writer schema from the User record
+    2. Looks up (or registers) that schema under subject users.v1-value
+    3. Prefixes the payload with a magic byte and the 4-byte schema ID
+    4. Serializes the record body in Avro binary - NO FIELD NAMES ON THE WIRE
+
+  That last point is why Avro beats JSON at volume: field names live in the
+  registry, not in every message.
+
+
+  THE CONSUMER SIDE
+
+  KafkaAvroDeserializer reads the schema ID from the payload prefix, fetches the
+  writer schema from the registry (cached after first fetch), and deserializes
+  using Avro's schema resolution - reconciling the writer schema against the
+  consumer's compiled-in reader schema.
+
+  Persistence goes through a @Transactional service so a mapping or constraint
+  failure rolls back cleanly rather than leaving a half-written row.
+
+
+  WHERE COMPATIBILITY IS ENFORCED
+
+  Compatibility is checked WHEN A SCHEMA IS REGISTERED, not when a message is
+  consumed. Under BACKWARD compatibility, the registry rejects a new version
+  that a current consumer could not read - so an incompatible change fails at
+  registration time, in CI, rather than as a deserialization storm in
+  production.
+
+
+--------------------------------------------------------------------------------
+  7. CONFIGURATION REFERENCE
+--------------------------------------------------------------------------------
+
+  PRODUCER - producer-app/src/main/resources/application.yml
+
+    Property                                       Default
+    ---------------------------------------------  ----------------------------
+    server.port                                    8080
+    spring.kafka.bootstrap-servers                 localhost:29092
+    spring.kafka.producer.key-serializer           StringSerializer
+    spring.kafka.producer.value-serializer         KafkaAvroSerializer
+    spring.kafka.properties.schema.registry.url    http://localhost:8081
+    spring.kafka.properties.auto.register.schemas  true (local) / false (cloud)
+    app.kafka.topic                                users.v1
+
+
+  CONSUMER - consumer-app/src/main/resources/application.yml
+
+    Property                                       Default
+    ---------------------------------------------  ----------------------------
+    server.port                                    8089
+    spring.kafka.consumer.group-id                 users-consumer
+    spring.kafka.consumer.auto-offset-reset        earliest
+    spring.kafka.properties.specific.avro.reader   true
+    spring.datasource.url                          jdbc:postgresql://
+                                                     localhost:5432/kafka
+    spring.jpa.hibernate.ddl-auto                  validate
+
+  NOTE: ddl-auto: validate is deliberate. "update" lets Hibernate silently
+  reshape production tables; "validate" refuses to start when the entity and
+  the table disagree.
+
+
+--------------------------------------------------------------------------------
+  8. SCHEMA EVOLUTION WALKTHROUGH
+--------------------------------------------------------------------------------
+
+  Adding a field without breaking the running consumer.
+
+
+  STEP 1 - SET THE COMPATIBILITY MODE
+
+    curl -X PUT http://localhost:8081/config/users.v1-value \
+      -H "Content-Type: application/json" \
+      -d '{"compatibility": "BACKWARD"}'
+
+
+  STEP 2 - ADD AN OPTIONAL FIELD, WITH A DEFAULT
+
+    {
+      "name": "nickname",
+      "type": ["null", "string"],
+      "default": null
+    }
+
+  The "default" is what makes this backward compatible. Without it, an old
+  consumer hits a record missing the field and has nothing to fall back on -
+  the registry will reject the schema.
+
+
+  STEP 3 - REGENERATE AND VERIFY
+
+    ./mvnw -pl common-schemas clean install
+
+  Dry-run the compatibility check before you deploy anything:
+
+    curl -X POST \
+      http://localhost:8081/compatibility/subjects/users.v1-value/versions/latest \
+      -H "Content-Type: application/json" \
+      -d '{"schema": "<escaped new schema>"}'
+    -> {"is_compatible": true}
+
+
+  STEP 4 - ROLL THE PRODUCER FIRST
+
+  Deploy the producer with the new schema. The OLD CONSUMER KEEPS RUNNING - it
+  reads new records and simply ignores the unknown field. Upgrade the consumer
+  whenever convenient.
+
+
+  COMPATIBILITY MODES AT A GLANCE
+
+    Mode       Safe change                          Upgrade order
+    ---------  -----------------------------------  ------------------------
+    BACKWARD   Add optional field, delete field     Consumers, then producers
+    FORWARD    Add field, delete optional field     Producers, then consumers
+    FULL       Add/delete optional fields only      Either order
+    NONE       Anything                             You are on your own
+
+
+--------------------------------------------------------------------------------
+  9. RUNNING AGAINST CONFLUENT CLOUD
+--------------------------------------------------------------------------------
+
+  Provision a cluster and Schema Registry at https://confluent.cloud/, then
+  export:
+
+    export CLOUD_BOOTSTRAP_SERVERS="pkc-xxxxx.us-central1.gcp.confluent.cloud:9092"
+    export CLOUD_API_KEY="<kafka-api-key>"
+    export CLOUD_API_SECRET="<kafka-api-secret>"
+    export SR_URL="https://psrc-xxxxx.us-central1.gcp.confluent.cloud"
+    export SR_API_KEY="<registry-api-key>"
+    export SR_API_SECRET="<registry-api-secret>"
+
+  Then:
+
+    cd consumer-app && ../mvnw spring-boot:run -Dspring-boot.run.profiles=cloud
+    cd producer-app && ../mvnw spring-boot:run -Dspring-boot.run.profiles=cloud
+
+  The cloud profile connects over SASL_SSL and flips two settings that matter:
+
+    auto.register.schemas: false   # apps may not mutate the registry
+    use.latest.version: true       # serialize against the registered schema
+
+  WHY: in a shared environment, a mis-deployed service that can auto-register
+  schemas can poison the contract for every other consumer. Registration
+  becomes a deliberate CI/CD step with review, not a side effect of a pod
+  starting up.
+
+  *** Never commit real API keys. .env and *.local.yml are gitignored. ***
+
+
+--------------------------------------------------------------------------------
+  10. TESTING
+--------------------------------------------------------------------------------
+
+    ./mvnw test                     unit tests
+    ./mvnw verify                   + integration tests
+    ./mvnw -pl producer-app test    single module
+
+  UNIT TESTS cover the MapStruct mappers, the validation layer, and the
+  persistence service with MockProducer / mocked repositories - no broker
+  required.
+
+  INTEGRATION TESTS use Testcontainers (https://www.testcontainers.org/) to
+  spin up real Kafka, Schema Registry, and PostgreSQL containers per run. This
+  is the only way to meaningfully test schema resolution: an embedded broker
+  without a registry exercises none of the code paths that actually matter
+  here.
+
+
+--------------------------------------------------------------------------------
+  11. TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+  > Subject not found; error code: 40401
+
+    The consumer started before any schema was registered. Publish one event
+    from the producer first, or pre-register the schema:
+
+      curl -X POST http://localhost:8081/subjects/users.v1-value/versions \
+        -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+        -d '{"schema": "<escaped User.avsc>"}'
+
+
+  > cannot find symbol: class User
+
+    common-schemas was not installed. Run the following from the PROJECT ROOT,
+    not from inside a module directory:
+
+      ./mvnw clean install -DskipTests
+
+
+  > Consumer receives nothing
+
+    Check the consumer group's offset position:
+
+      docker compose exec kafka kafka-consumer-groups \
+        --bootstrap-server localhost:9092 --describe --group users-consumer
+
+    LAG = 0 with no records means the group already consumed them. Reset:
+
+      docker compose exec kafka kafka-consumer-groups \
+        --bootstrap-server localhost:9092 --group users-consumer \
+        --reset-offsets --to-earliest --topic users.v1 --execute
+
+
+  > Schema being registered under an unexpected subject
+
+    Confluent's default TopicNameStrategy derives the subject from the topic
+    (users.v1-value). If you are publishing multiple event types to one topic
+    you want RecordNameStrategy instead:
+
+      spring.kafka.properties.value.subject.name.strategy: \
+        io.confluent.kafka.serializers.subject.RecordNameStrategy
+
+
+  > Schema Registry container will not start
+
+    It depends on Kafka being fully up. "docker compose logs schema-registry"
+    usually shows connection retries. Restart just that service after Kafka
+    settles:
+
+      docker compose restart schema-registry
+
+
+--------------------------------------------------------------------------------
+  12. DESIGN DECISIONS
+--------------------------------------------------------------------------------
+
+  AVRO OVER JSON SCHEMA OR PROTOBUF
+    Avro's compact binary encoding and mature schema-resolution rules make it
+    the default in the Kafka ecosystem, and Confluent's tooling is deepest
+    here. Protobuf is a reasonable swap - the registry supports it and the
+    serializer config is a one-line change.
+
+  MAPSTRUCT OVER HAND-WRITTEN MAPPERS
+    Compile-time generation means a schema field change surfaces as a build
+    failure rather than a silently null column.
+
+  auto.register.schemas=false OUTSIDE LOCAL
+    Schema registration is a deployment concern with review and rollback, not
+    something an application does implicitly on startup.
+
+  SEPARATE PRODUCER AND CONSUMER MODULES
+    They share only the schema. That is the constraint that makes the
+    schema-evolution demo real rather than theoretical - if they shared a DTO
+    jar, evolution would just be a recompile.
+
+  ddl-auto: validate
+    Fail loudly at startup on entity/table drift instead of letting Hibernate
+    reshape a table underneath you.
+
+
+--------------------------------------------------------------------------------
+  13. ROADMAP
+--------------------------------------------------------------------------------
+
+  1. Dead-letter topic for deserialization failures
+  2. Testcontainers integration test suite
+  3. GitHub Actions workflow - build, test, registry compatibility check on PR
+  4. Idempotent consumer with a processed-event ledger
+  5. Micrometer metrics + Grafana dashboard for consumer lag
+  6. Protobuf variant on a parallel branch
+
+
+
+
